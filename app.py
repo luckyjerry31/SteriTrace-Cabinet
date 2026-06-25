@@ -1,9 +1,9 @@
-import os
-import json
 import base64
+import json
 import sqlite3
+from datetime import date, datetime, timedelta
 from io import BytesIO
-from datetime import datetime, timedelta, date
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import qrcode
@@ -12,206 +12,267 @@ import streamlit.components.v1 as components
 
 try:
     from supabase import create_client
-except Exception:
+except Exception:  # pragma: no cover
     create_client = None
 
 
 # =========================================================
-# CONFIG
+# CONFIGURATION CABINET
 # =========================================================
-APP_TITLE = "SteriTrace Cabinet"
+APP_NAME = "SteriTrace"
+APP_SUBTITLE = "Traçabilité stérilisation, lots et dossiers patients"
+
 OPERATORS = {
     "1234": "Dr Sébastien",
     "5678": "Assistante AD1",
+    "9012": "Manon Moreau",
 }
-AUTOCLAVES = {
-    "Autoclave Euronda Classe B": "SN-EURONDA-2026",
-    "Dac Universal (Rotatifs)": "SN-DAC-2026",
+
+STERILIZERS = {
+    "Autoclave 1": "SN-AUTO-001",
+    "Autoclave 2": "SN-AUTO-002",
+    "DAC Universal": "SN-DAC-001",
 }
-MEDICAL_DEVICES = [
-    "[Instruments] Miroir + Sonde + Précelles",
-    "[Instruments] Seringue d'anesthésie",
-    "[Rotatifs] Contre-angle bague rouge",
-    "[Rotatifs] Turbine",
-    "[Chirurgie] Kit implantologie",
-    "[Chirurgie] Daviers d'extraction",
-    "[Cassettes] Cassette restauration",
-    "[Endodontie] Set endo",
+
+DEVICES = [
+    {"name": "Contre-angle", "category": "Rotatifs", "shelf_days": 90, "favorite": True},
+    {"name": "Curette", "category": "Soins", "shelf_days": 90, "favorite": True},
+    {"name": "K7 soins", "category": "Soins", "shelf_days": 90, "favorite": True},
+    {"name": "Miroir", "category": "Soins", "shelf_days": 90, "favorite": True},
+    {"name": "Fraise", "category": "Rotatifs", "shelf_days": 90, "favorite": False},
+    {"name": "Sonde", "category": "Soins", "shelf_days": 90, "favorite": False},
+    {"name": "Précelles", "category": "Soins", "shelf_days": 90, "favorite": False},
+    {"name": "Davier", "category": "Chirurgie", "shelf_days": 90, "favorite": False},
+    {"name": "Turbine", "category": "Rotatifs", "shelf_days": 90, "favorite": False},
+    {"name": "Cassette chirurgie", "category": "Chirurgie", "shelf_days": 180, "favorite": False},
+]
+
+CYCLE_TYPES = [
+    "Prion 134°C - 18 min",
+    "Helix",
+    "Vacuum",
+    "Bowie-Dick",
 ]
 
 
 # =========================================================
-# APP
+# STREAMLIT SETUP
 # =========================================================
 st.set_page_config(
-    page_title=APP_TITLE,
+    page_title=APP_NAME,
     page_icon="🛡️",
     layout="wide",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 
 # =========================================================
-# HELPERS
+# UTILITAIRES
 # =========================================================
-def normalize_supabase_url(url: str) -> str:
-    if not url:
-        return url
-    url = url.strip()
-    if url.endswith("/"):
-        url = url[:-1]
+def clean_supabase_url(url: str) -> str:
+    url = (url or "").strip()
     if "/rest/v1" in url:
         url = url.split("/rest/v1")[0]
-    return url
+    return url.rstrip("/")
 
 
-def today_str():
-    return datetime.now().strftime("%Y-%m-%d")
-
-
-def now_iso():
+def now_iso() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
-def current_week_key():
-    today = date.today()
-    year, week_num, _ = today.isocalendar()
-    return f"{year}-W{week_num:02d}"
+def today_iso() -> str:
+    return date.today().isoformat()
 
 
-def bool_to_int(value):
-    return 1 if value else 0
+def current_month_label() -> str:
+    return datetime.now().strftime("%B %Y")
 
 
-def int_to_bool(value):
-    return bool(value) if value is not None else False
+def fr_date(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    try:
+        if "T" in text:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        elif " " in text:
+            dt = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        else:
+            dt = datetime.strptime(text[:10], "%Y-%m-%d")
+        return dt.strftime("%d/%m/%Y")
+    except Exception:
+        return text
 
 
-def make_qr_base64(text: str) -> str:
-    qr = qrcode.QRCode(version=1, box_size=4, border=1)
-    qr.add_data(text)
+def fr_datetime(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value)
+    try:
+        if "T" in text:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        else:
+            dt = datetime.strptime(text[:19], "%Y-%m-%d %H:%M:%S")
+        return dt.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return text
+
+
+def make_qr_base64(payload: str) -> str:
+    qr = qrcode.QRCode(version=2, error_correction=qrcode.constants.ERROR_CORRECT_M, box_size=4, border=1)
+    qr.add_data(payload)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
-    buffer = BytesIO()
-    img.save(buffer, format="PNG")
-    return base64.b64encode(buffer.getvalue()).decode()
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
 
 
-def render_print_button(label="Imprimer"):
+def safe_json_load(value: Any, default: Any) -> Any:
+    if value is None:
+        return default
+    if isinstance(value, (list, dict)):
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+def device_by_name(name: str) -> Dict[str, Any]:
+    for device in DEVICES:
+        if device["name"] == name:
+            return device
+    return {"name": name, "category": "Autre", "shelf_days": 90, "favorite": False}
+
+
+def add_to_cart(device_name: str, qty: int = 1) -> None:
+    cart = st.session_state.setdefault("cart", {})
+    cart[device_name] = int(cart.get(device_name, 0)) + int(qty)
+
+
+def remove_from_cart(device_name: str) -> None:
+    cart = st.session_state.setdefault("cart", {})
+    if device_name in cart:
+        del cart[device_name]
+
+
+def cart_items() -> List[Dict[str, Any]]:
+    items = []
+    for name, qty in st.session_state.get("cart", {}).items():
+        device = device_by_name(name)
+        items.append({"name": name, "qty": int(qty), "category": device["category"], "shelf_days": device["shelf_days"]})
+    return items
+
+
+def cart_total() -> int:
+    return sum(item["qty"] for item in cart_items())
+
+
+def render_print_button(label: str = "Imprimer") -> None:
     components.html(
         f"""
         <button onclick="window.print()" style="
             width:100%;
-            border:none;
-            padding:14px 18px;
-            border-radius:12px;
-            background:#0f172a;
+            background:#174f96;
             color:white;
-            font-weight:600;
-            font-size:14px;
-            cursor:pointer;
-            box-shadow:0 10px 24px rgba(15,23,42,0.12);
-        ">
+            border:none;
+            padding:12px 18px;
+            border-radius:8px;
+            font-weight:700;
+            font-size:13px;
+            cursor:pointer;">
             🖨️ {label}
         </button>
         """,
-        height=60,
+        height=52,
     )
 
 
-def reset_cycle_state():
-    st.session_state.step = 1
-    st.session_state.operator_name = None
-    st.session_state.cycle_data = {}
-    st.session_state.selected_devices = []
-    st.session_state.calculated_dlu = None
-    st.session_state.generated_lot_full = None
-    st.session_state.generated_lot_short = None
+def render_download_html(filename: str, html: str, label: str) -> None:
+    b64 = base64.b64encode(html.encode("utf-8")).decode("utf-8")
+    components.html(
+        f"""
+        <a download="{filename}" href="data:text/html;base64,{b64}" style="
+            display:block;text-align:center;text-decoration:none;
+            width:100%;background:#f8fafc;color:#174f96;border:1px solid #dbe5f0;
+            padding:11px 18px;border-radius:8px;font-weight:700;font-size:13px;">
+            ⬇️ {label}
+        </a>
+        """,
+        height=52,
+    )
 
 
 # =========================================================
-# DATABASE LAYER
+# STOCKAGE SUPABASE / SQLITE
 # =========================================================
 class Storage:
-    def __init__(self):
-        self.mode = "sqlite"
+    def __init__(self) -> None:
+        self.mode = "SQLite local démo"
         self.error = None
-        self.supabase = None
+        self.client = None
+        self.conn = None
 
-        supabase_url = None
-        supabase_key = None
-
+        supabase_url = ""
+        supabase_key = ""
         try:
-            supabase_url = normalize_supabase_url(st.secrets.get("SUPABASE_URL", ""))
+            supabase_url = clean_supabase_url(st.secrets.get("SUPABASE_URL", ""))
             supabase_key = st.secrets.get("SUPABASE_KEY", "")
         except Exception:
             pass
 
         if create_client and supabase_url and supabase_key:
             try:
-                self.supabase = create_client(supabase_url, supabase_key)
-                # test léger
-                self.supabase.table("sterilization_cycles").select("id").limit(1).execute()
-                self.mode = "supabase"
-            except Exception as e:
-                self.error = str(e)
-                self.mode = "sqlite"
+                self.client = create_client(supabase_url, supabase_key)
+                self.client.table("sterilization_events").select("id").limit(1).execute()
+                self.mode = "Supabase"
+            except Exception as exc:
+                self.error = str(exc)
+                self.client = None
 
-        if self.mode == "sqlite":
-            self.conn = sqlite3.connect("steritrace_local.db", check_same_thread=False)
+        if self.client is None:
+            self.conn = sqlite3.connect("steritrace_v3_local.db", check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
-            self.init_sqlite()
+            self._init_sqlite()
 
-    def init_sqlite(self):
+    def _init_sqlite(self) -> None:
         cur = self.conn.cursor()
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS sterilization_cycles (
+            CREATE TABLE IF NOT EXISTS sterilization_events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                lot_number TEXT UNIQUE,
-                lot_short TEXT,
+                event_type TEXT,
+                event_label TEXT,
+                event_date TEXT,
                 operator_name TEXT,
-                autoclave_name TEXT,
-                serial_number TEXT,
+                sterilizer_name TEXT,
+                sterilizer_serial TEXT,
                 cycle_number TEXT,
                 cycle_type TEXT,
-                devices TEXT,
-                packaging_type TEXT,
+                lot_number TEXT UNIQUE,
+                lot_short TEXT,
                 dlu_date TEXT,
-                precheck_helix_ok INTEGER,
-                precheck_vacuum_ok INTEGER,
-                ticket_ok INTEGER,
-                temp_ok INTEGER,
-                duration_ok INTEGER,
-                pressure_ok INTEGER,
-                dry_ok INTEGER,
-                seal_ok INTEGER,
-                indicator_ok INTEGER,
-                prion_ok INTEGER,
-                released_ok INTEGER,
+                packaging_type TEXT,
+                identification_mode TEXT,
+                devices_json TEXT,
+                devices_count INTEGER,
+                checks_json TEXT,
+                status TEXT,
                 created_at TEXT
             )
             """
         )
         cur.execute(
             """
-            CREATE TABLE IF NOT EXISTS daily_controls (
+            CREATE TABLE IF NOT EXISTS patient_traceability (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                control_date TEXT UNIQUE,
-                helix_ok INTEGER,
-                operator_name TEXT,
-                notes TEXT,
-                created_at TEXT
-            )
-            """
-        )
-        cur.execute(
-            """
-            CREATE TABLE IF NOT EXISTS weekly_controls (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                week_key TEXT UNIQUE,
-                vacuum_ok INTEGER,
-                operator_name TEXT,
+                patient_ref TEXT,
+                act_label TEXT,
+                practitioner_name TEXT,
+                lot_number TEXT,
+                lot_short TEXT,
+                used_at TEXT,
                 notes TEXT,
                 created_at TEXT
             )
@@ -219,183 +280,81 @@ class Storage:
         )
         self.conn.commit()
 
-    # ---------- Controls ----------
-    def save_daily_control(self, control_date, helix_ok, operator_name, notes=""):
-        payload = {
-            "control_date": control_date,
-            "helix_ok": bool(helix_ok),
-            "operator_name": operator_name,
-            "notes": notes,
-            "created_at": now_iso(),
-        }
-        if self.mode == "supabase":
-            existing = self.supabase.table("daily_controls").select("*").eq("control_date", control_date).execute()
-            if existing.data:
-                row_id = existing.data[0]["id"]
-                self.supabase.table("daily_controls").update(payload).eq("id", row_id).execute()
-            else:
-                self.supabase.table("daily_controls").insert(payload).execute()
+    def list_events(self, limit: int = 500) -> List[Dict[str, Any]]:
+        if self.client:
+            res = self.client.table("sterilization_events").select("*").order("created_at", desc=True).limit(limit).execute()
+            rows = res.data or []
         else:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO daily_controls(control_date, helix_ok, operator_name, notes, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(control_date) DO UPDATE SET
-                    helix_ok=excluded.helix_ok,
-                    operator_name=excluded.operator_name,
-                    notes=excluded.notes,
-                    created_at=excluded.created_at
-                """,
-                (control_date, bool_to_int(helix_ok), operator_name, notes, now_iso()),
-            )
-            self.conn.commit()
+            rows = [dict(r) for r in self.conn.execute(
+                "SELECT * FROM sterilization_events ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()]
+        for row in rows:
+            row["devices_json"] = safe_json_load(row.get("devices_json"), [])
+            row["checks_json"] = safe_json_load(row.get("checks_json"), {})
+        return rows
 
-    def get_daily_control(self, control_date):
-        if self.mode == "supabase":
-            res = self.supabase.table("daily_controls").select("*").eq("control_date", control_date).limit(1).execute()
-            return res.data[0] if res.data else None
-        cur = self.conn.cursor()
-        row = cur.execute("SELECT * FROM daily_controls WHERE control_date=?", (control_date,)).fetchone()
-        return dict(row) if row else None
+    def insert_event(self, payload: Dict[str, Any]) -> None:
+        if self.client:
+            self.client.table("sterilization_events").insert(payload).execute()
+            return
+        local = dict(payload)
+        local["devices_json"] = json.dumps(local.get("devices_json", []), ensure_ascii=False)
+        local["checks_json"] = json.dumps(local.get("checks_json", {}), ensure_ascii=False)
+        cols = list(local.keys())
+        placeholders = ",".join(["?"] * len(cols))
+        self.conn.execute(
+            f"INSERT INTO sterilization_events ({','.join(cols)}) VALUES ({placeholders})",
+            [local[c] for c in cols],
+        )
+        self.conn.commit()
 
-    def save_weekly_control(self, week_key, vacuum_ok, operator_name, notes=""):
-        payload = {
-            "week_key": week_key,
-            "vacuum_ok": bool(vacuum_ok),
-            "operator_name": operator_name,
-            "notes": notes,
-            "created_at": now_iso(),
-        }
-        if self.mode == "supabase":
-            existing = self.supabase.table("weekly_controls").select("*").eq("week_key", week_key).execute()
-            if existing.data:
-                row_id = existing.data[0]["id"]
-                self.supabase.table("weekly_controls").update(payload).eq("id", row_id).execute()
-            else:
-                self.supabase.table("weekly_controls").insert(payload).execute()
-        else:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO weekly_controls(week_key, vacuum_ok, operator_name, notes, created_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT(week_key) DO UPDATE SET
-                    vacuum_ok=excluded.vacuum_ok,
-                    operator_name=excluded.operator_name,
-                    notes=excluded.notes,
-                    created_at=excluded.created_at
-                """,
-                (week_key, bool_to_int(vacuum_ok), operator_name, notes, now_iso()),
-            )
-            self.conn.commit()
-
-    def get_weekly_control(self, week_key):
-        if self.mode == "supabase":
-            res = self.supabase.table("weekly_controls").select("*").eq("week_key", week_key).limit(1).execute()
-            return res.data[0] if res.data else None
-        cur = self.conn.cursor()
-        row = cur.execute("SELECT * FROM weekly_controls WHERE week_key=?", (week_key,)).fetchone()
-        return dict(row) if row else None
-
-    # ---------- Cycles ----------
-    def list_cycles(self, limit=100):
-        if self.mode == "supabase":
-            query = self.supabase.table("sterilization_cycles").select("*").order("created_at", desc=True)
-            if limit:
-                query = query.limit(limit)
-            res = query.execute()
-            return res.data if res.data else []
-        cur = self.conn.cursor()
-        if limit:
-            rows = cur.execute(
-                "SELECT * FROM sterilization_cycles ORDER BY created_at DESC LIMIT ?",
-                (limit,),
-            ).fetchall()
-        else:
-            rows = cur.execute(
-                "SELECT * FROM sterilization_cycles ORDER BY created_at DESC"
-            ).fetchall()
-        return [dict(r) for r in rows]
-
-    def count_cycles(self):
-        if self.mode == "supabase":
-            res = self.supabase.table("sterilization_cycles").select("id").execute()
-            return len(res.data) if res.data else 0
-        cur = self.conn.cursor()
-        row = cur.execute("SELECT COUNT(*) as n FROM sterilization_cycles").fetchone()
-        return row["n"] if row else 0
-
-    def next_lot_sequence(self):
-        return self.count_cycles() + 1
-
-    def insert_cycle(self, payload: dict):
-        if self.mode == "supabase":
-            self.supabase.table("sterilization_cycles").insert(payload).execute()
-        else:
-            cur = self.conn.cursor()
-            cur.execute(
-                """
-                INSERT INTO sterilization_cycles(
-                    lot_number, lot_short, operator_name, autoclave_name, serial_number,
-                    cycle_number, cycle_type, devices, packaging_type, dlu_date,
-                    precheck_helix_ok, precheck_vacuum_ok, ticket_ok, temp_ok,
-                    duration_ok, pressure_ok, dry_ok, seal_ok, indicator_ok,
-                    prion_ok, released_ok, created_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    payload["lot_number"],
-                    payload["lot_short"],
-                    payload["operator_name"],
-                    payload["autoclave_name"],
-                    payload["serial_number"],
-                    payload["cycle_number"],
-                    payload["cycle_type"],
-                    payload["devices"],
-                    payload["packaging_type"],
-                    payload["dlu_date"],
-                    bool_to_int(payload["precheck_helix_ok"]),
-                    bool_to_int(payload["precheck_vacuum_ok"]),
-                    bool_to_int(payload["ticket_ok"]),
-                    bool_to_int(payload["temp_ok"]),
-                    bool_to_int(payload["duration_ok"]),
-                    bool_to_int(payload["pressure_ok"]),
-                    bool_to_int(payload["dry_ok"]),
-                    bool_to_int(payload["seal_ok"]),
-                    bool_to_int(payload["indicator_ok"]),
-                    bool_to_int(payload["prion_ok"]),
-                    bool_to_int(payload["released_ok"]),
-                    payload["created_at"],
-                ),
-            )
-            self.conn.commit()
-
-    def find_cycle(self, value: str):
-        value = value.strip()
+    def find_event_by_lot(self, value: str) -> Optional[Dict[str, Any]]:
+        value = (value or "").strip()
         if not value:
             return None
+        if self.client:
+            res = self.client.table("sterilization_events").select("*").or_(
+                f"lot_number.eq.{value},lot_short.eq.{value}"
+            ).limit(1).execute()
+            rows = res.data or []
+            if not rows:
+                return None
+            row = rows[0]
+        else:
+            dbrow = self.conn.execute(
+                "SELECT * FROM sterilization_events WHERE lot_number=? OR lot_short=? LIMIT 1",
+                (value, value),
+            ).fetchone()
+            if not dbrow:
+                return None
+            row = dict(dbrow)
+        row["devices_json"] = safe_json_load(row.get("devices_json"), [])
+        row["checks_json"] = safe_json_load(row.get("checks_json"), {})
+        return row
 
-        if self.mode == "supabase":
-            res1 = self.supabase.table("sterilization_cycles").select("*").eq("lot_number", value).limit(1).execute()
-            if res1.data:
-                return res1.data[0]
-            res2 = self.supabase.table("sterilization_cycles").select("*").eq("lot_short", value).limit(1).execute()
-            if res2.data:
-                return res2.data[0]
-            return None
+    def next_sequence(self) -> int:
+        count = len(self.list_events(limit=2000))
+        return count + 1
 
-        cur = self.conn.cursor()
-        row = cur.execute(
-            """
-            SELECT * FROM sterilization_cycles
-            WHERE lot_number=? OR lot_short=?
-            LIMIT 1
-            """,
-            (value, value),
-        ).fetchone()
-        return dict(row) if row else None
+    def insert_patient_link(self, payload: Dict[str, Any]) -> None:
+        if self.client:
+            self.client.table("patient_traceability").insert(payload).execute()
+            return
+        cols = list(payload.keys())
+        placeholders = ",".join(["?"] * len(cols))
+        self.conn.execute(
+            f"INSERT INTO patient_traceability ({','.join(cols)}) VALUES ({placeholders})",
+            [payload[c] for c in cols],
+        )
+        self.conn.commit()
+
+    def list_patient_links(self, limit: int = 200) -> List[Dict[str, Any]]:
+        if self.client:
+            res = self.client.table("patient_traceability").select("*").order("created_at", desc=True).limit(limit).execute()
+            return res.data or []
+        return [dict(r) for r in self.conn.execute(
+            "SELECT * FROM patient_traceability ORDER BY created_at DESC LIMIT ?", (limit,)
+        ).fetchall()]
 
 
 storage = Storage()
@@ -406,234 +365,131 @@ storage = Storage()
 # =========================================================
 if "menu" not in st.session_state:
     st.session_state.menu = "Dashboard"
-if "step" not in st.session_state:
-    st.session_state.step = 1
-if "operator_name" not in st.session_state:
-    st.session_state.operator_name = None
-if "cycle_data" not in st.session_state:
-    st.session_state.cycle_data = {}
-if "selected_devices" not in st.session_state:
-    st.session_state.selected_devices = []
-if "calculated_dlu" not in st.session_state:
-    st.session_state.calculated_dlu = None
-if "generated_lot_full" not in st.session_state:
-    st.session_state.generated_lot_full = None
-if "generated_lot_short" not in st.session_state:
-    st.session_state.generated_lot_short = None
-if "patient_basket" not in st.session_state:
-    st.session_state.patient_basket = []
+if "label_step" not in st.session_state:
+    st.session_state.label_step = 1
+if "cart" not in st.session_state:
+    st.session_state.cart = {}
+if "draft" not in st.session_state:
+    st.session_state.draft = {}
+if "patient_cart" not in st.session_state:
+    st.session_state.patient_cart = []
+
+
+def reset_label_workflow() -> None:
+    st.session_state.label_step = 1
+    st.session_state.cart = {}
+    st.session_state.draft = {}
 
 
 # =========================================================
-# DESIGN
+# CSS DESIGN INSPIRÉ SAAS MÉDICAL
 # =========================================================
 st.markdown(
     """
     <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 
-    html, body, [class*="css"] {
-        font-family: 'Inter', sans-serif;
+    :root {
+        --blue:#174f96;
+        --blue2:#2563eb;
+        --green:#16a34a;
+        --border:#dfe8f3;
+        --muted:#637083;
+        --light:#f7faff;
+        --soft:#eef6ff;
+        --ink:#0f172a;
     }
 
-    .stApp {
-        background:
-            radial-gradient(circle at top left, rgba(59,130,246,0.05), transparent 30%),
-            linear-gradient(180deg, #f8fbff 0%, #f4f7fb 100%);
-    }
+    html, body, [class*="css"] { font-family:'Inter', sans-serif; }
+    .stApp { background:#f8fbff; color:var(--ink); }
+    [data-testid="stHeader"], #MainMenu, footer { display:none!important; }
+    .block-container { max-width:1220px!important; padding:18px 24px 60px 24px!important; }
 
-    [data-testid="stHeader"], #MainMenu, footer {
-        display: none !important;
+    [data-testid="stSidebar"] {
+        background:#ffffff;
+        border-right:1px solid #e4edf7;
+        box-shadow: 2px 0 18px rgba(15,23,42,0.03);
     }
+    [data-testid="stSidebar"] .block-container { padding-top:18px!important; padding-left:16px!important; padding-right:14px!important; }
 
-    .block-container {
-        max-width: 1180px !important;
-        padding-top: 24px !important;
-        padding-bottom: 60px !important;
-    }
+    h1, h2, h3 { letter-spacing:-0.03em; color:#13243a; }
+    h1 { font-size:26px!important; font-weight:800!important; margin-bottom:3px!important; }
+    h2 { font-size:20px!important; font-weight:800!important; }
+    h3 { font-size:16px!important; font-weight:750!important; }
+    p, li, label, span { color:#536579; }
 
-    .topbar {
-        background: rgba(255,255,255,0.88);
-        backdrop-filter: blur(10px);
-        border: 1px solid rgba(226,232,240,0.9);
-        border-radius: 22px;
-        padding: 18px 22px;
-        display:flex;
-        align-items:center;
-        justify-content:space-between;
-        margin-bottom: 20px;
-        box-shadow: 0 8px 40px rgba(15,23,42,0.05);
-    }
+    .app-logo { display:flex; align-items:center; gap:10px; margin-bottom:18px; }
+    .app-logo .mark { width:36px; height:36px; border-radius:10px; background:#174f96; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:800; }
+    .app-logo .name { font-size:18px; font-weight:800; color:#13243a; }
+    .app-logo .sub { font-size:11px; color:#7c8da3; margin-top:-2px; }
 
-    .brand-title {
-        font-size: 20px;
-        font-weight: 800;
-        color: #0f172a;
-        letter-spacing: -0.03em;
-    }
+    .sidebar-small-title { font-size:10px; color:#a0aec0; font-weight:800; letter-spacing:.08em; text-transform:uppercase; margin:18px 0 8px; }
+    .side-muted { font-size:12px; padding:8px 10px; border-radius:8px; color:#9aa9bb; display:flex; justify-content:space-between; }
+    .side-disclaimer { font-size:10px; line-height:1.45; color:#8493a6; background:#f8fafc; border:1px solid #e6eef8; border-radius:10px; padding:10px; margin-top:18px; }
 
-    .brand-sub {
-        font-size: 12px;
-        color: #64748b;
-        margin-top: 3px;
-    }
+    .hero-title { display:flex; align-items:center; gap:10px; }
+    .page-subtitle { color:#6b7c90; font-size:13px; margin-top:-2px; margin-bottom:18px; }
+    .content-card { background:#fff; border:1px solid var(--border); border-radius:10px; padding:18px; box-shadow:0 8px 26px rgba(15,23,42,.03); margin-bottom:14px; }
+    .flat-card { background:#fff; border:1px solid var(--border); border-radius:8px; padding:14px; margin-bottom:10px; }
+    .blue-card { background:#eff6ff; border:1px solid #d8e9ff; border-radius:10px; padding:14px; }
+    .kpi-row { display:flex; gap:0; border:1px solid var(--border); border-radius:8px; overflow:hidden; background:#fff; margin-bottom:12px; }
+    .kpi-pill { flex:1; padding:11px 14px; border-right:1px solid #edf2f7; font-size:13px; color:#475569; }
+    .kpi-pill:last-child { border-right:none; }
+    .kpi-pill strong { color:#13243a; font-weight:800; }
+    .metric-dot { display:inline-flex; width:18px; height:18px; border-radius:999px; align-items:center; justify-content:center; background:#edf6ff; color:#174f96; margin-right:6px; font-size:11px; }
+    .green-dot { background:#ecfdf3; color:#16a34a; }
+    .muted-dot { background:#f3f6fa; color:#64748b; }
 
-    .status-pill {
-        display:inline-flex;
-        align-items:center;
-        gap:8px;
-        border-radius:999px;
-        padding:8px 12px;
-        font-size:12px;
-        font-weight:700;
-        background:#eff6ff;
-        color:#1d4ed8;
-        border:1px solid #dbeafe;
-    }
+    .two-grid { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    .three-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:12px; }
+    .tag { display:inline-flex; align-items:center; gap:5px; border:1px solid #dbeafe; color:#174f96; background:#f0f7ff; padding:4px 9px; border-radius:999px; font-size:12px; font-weight:700; margin-right:5px; }
+    .tag.green { color:#15803d; border-color:#bbf7d0; background:#f0fdf4; }
+    .tag.gray { color:#64748b; border-color:#e2e8f0; background:#f8fafc; }
+    .small-muted { color:#7b8ca3; font-size:12px; }
 
-    .card {
-        background: rgba(255,255,255,0.94);
-        border: 1px solid #e5edf5;
-        border-radius: 22px;
-        padding: 24px;
-        box-shadow: 0 12px 40px rgba(15,23,42,0.05);
-        margin-bottom: 18px;
-    }
+    .stepper { display:flex; align-items:center; gap:8px; margin:8px 0 18px; }
+    .step { flex:1; display:flex; align-items:center; gap:7px; font-size:12px; font-weight:800; color:#64748b; }
+    .step-line { height:2px; background:#bfd3ea; flex:1; }
+    .step .num { width:22px; height:22px; border-radius:999px; display:inline-flex; align-items:center; justify-content:center; border:1px solid #c9d8ea; background:#fff; color:#64748b; }
+    .step.active .num { background:#174f96; border-color:#174f96; color:#fff; }
+    .step.active { color:#174f96; }
 
-    .section-title {
-        font-size: 24px;
-        font-weight: 800;
-        color: #0f172a;
-        letter-spacing: -0.03em;
-        margin-bottom: 6px;
-    }
+    .device-card { background:#fff; border:1px solid #e2eaf4; border-radius:8px; padding:11px; min-height:84px; }
+    .device-name { font-weight:800; color:#13243a; font-size:13px; }
+    .device-sub { font-size:11px; color:#7b8ca3; margin-bottom:8px; }
+    .selection-card { background:#fff; border:1px solid #dfe8f3; border-radius:10px; padding:16px; position:sticky; top:12px; }
+    .cart-row { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:8px 0; border-bottom:1px solid #eef2f7; }
+    .cart-row:last-child { border-bottom:none; }
 
-    .section-sub {
-        color: #64748b;
-        font-size: 14px;
-        margin-bottom: 20px;
-    }
+    .label-grid { display:grid; grid-template-columns:repeat(2, minmax(260px, 1fr)); gap:12px; }
+    .qr-label { background:white; border:1px solid #dfe8f3; border-radius:8px; padding:10px; min-height:128px; display:flex; justify-content:space-between; gap:8px; color:#111827; }
+    .qr-label-title { font-size:12px; font-weight:900; color:#0f172a; margin-bottom:4px; }
+    .qr-label-text { font-size:9.5px; line-height:1.4; color:#111827; }
+    .qr-brand { display:flex; align-items:center; justify-content:flex-end; gap:4px; font-size:11px; font-weight:800; color:#13243a; margin-bottom:5px; }
+    .recap-panel { background:white; border:1px solid #dfe8f3; border-radius:10px; padding:16px; }
+    .manual-mark { background:#174f96; color:white; border-radius:10px; padding:18px; margin-bottom:12px; }
+    .manual-mark .big { font-size:28px; font-weight:900; color:white; line-height:1.2; }
+    .manual-mark .subtext { font-size:12px; color:#dbeafe; margin-top:8px; }
 
-    .mini-title {
-        font-size: 15px;
-        font-weight: 700;
-        color: #0f172a;
-        margin-bottom: 6px;
-    }
+    .doc-page { background:#fff; border:1px solid #dfe8f3; border-radius:8px; padding:0; overflow:hidden; box-shadow:0 10px 32px rgba(15,23,42,.05); }
+    .doc-header { padding:18px 22px; border-bottom:1px solid #dfe8f3; display:flex; justify-content:space-between; align-items:flex-start; }
+    .doc-band { height:34px; background:#174f96; color:white; font-size:12px; font-weight:800; display:flex; align-items:center; padding:0 22px; text-transform:uppercase; letter-spacing:.04em; }
+    .doc-body { padding:22px; }
+    .doc-table { width:100%; border-collapse:collapse; font-size:12px; }
+    .doc-table th { text-align:left; color:#64748b; background:#f8fafc; border-bottom:1px solid #dfe8f3; padding:8px; font-size:11px; text-transform:uppercase; }
+    .doc-table td { border-bottom:1px solid #edf2f7; padding:8px; color:#24364b; }
 
-    .kpi {
-        background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
-        border: 1px solid #e5edf5;
-        border-radius: 20px;
-        padding: 20px;
-        box-shadow: 0 12px 28px rgba(15,23,42,0.04);
-    }
-
-    .kpi-label {
-        color:#64748b;
-        font-size:12px;
-        text-transform:uppercase;
-        letter-spacing:0.06em;
-        font-weight:700;
-    }
-
-    .kpi-value {
-        color:#0f172a;
-        font-size:32px;
-        font-weight:800;
-        letter-spacing:-0.03em;
-        margin-top:8px;
-    }
-
-    .soft-box {
-        background:#f8fbff;
-        border:1px solid #e6eef8;
-        border-radius:16px;
-        padding:16px;
-    }
-
-    .success-chip {
-        display:inline-block;
-        border-radius:999px;
-        padding:6px 10px;
-        background:#ecfdf3;
-        color:#047857;
-        border:1px solid #d1fae5;
-        font-size:12px;
-        font-weight:700;
-    }
-
-    .warn-chip {
-        display:inline-block;
-        border-radius:999px;
-        padding:6px 10px;
-        background:#fff7ed;
-        color:#c2410c;
-        border:1px solid #fed7aa;
-        font-size:12px;
-        font-weight:700;
-    }
-
-    .mark-box {
-        background: #0f172a;
-        color: white;
-        border-radius: 18px;
-        padding: 18px;
-        line-height: 1.8;
-    }
-
-    .mark-box strong {
-        color: #93c5fd;
-    }
-
-    .report-box {
-        background: white;
-        border: 1px solid #e2e8f0;
-        border-radius: 18px;
-        padding: 24px;
-    }
-
-    .stButton > button {
-        width: 100%;
-        border: none !important;
-        border-radius: 14px !important;
-        padding: 12px 18px !important;
-        font-weight: 700 !important;
-        background: linear-gradient(180deg, #1d4ed8 0%, #2563eb 100%) !important;
-        color: white !important;
-        box-shadow: 0 12px 24px rgba(37,99,235,0.18) !important;
-    }
-
-    .stDownloadButton > button {
-        width: 100%;
-        border-radius: 14px !important;
-        font-weight: 700 !important;
-    }
-
-    div[data-testid="stMetric"] {
-        background: white;
-        border:1px solid #e5edf5;
-        padding:18px;
-        border-radius:18px;
-    }
+    .stButton > button { border-radius:8px!important; border:1px solid #cfe0f3!important; background:#fff!important; color:#174f96!important; font-weight:800!important; font-size:12px!important; min-height:38px; }
+    .stButton > button:hover { border-color:#174f96!important; color:#174f96!important; background:#f1f7ff!important; }
+    div[data-testid="stForm"] { border:0!important; padding:0!important; }
+    div[data-testid="stDataFrame"] { border-radius:10px!important; overflow:hidden; }
 
     @media print {
-        [data-testid="stHeader"], #MainMenu, footer,
-        .no-print, .topbar, .stButton, .stDownloadButton {
-            display:none !important;
-        }
-        .block-container {
-            max-width: 100% !important;
-            padding: 0 !important;
-            margin: 0 !important;
-        }
-        .stApp {
-            background: white !important;
-        }
-        .card, .report-box {
-            box-shadow:none !important;
-            border:none !important;
-        }
+        [data-testid="stSidebar"], [data-testid="stHeader"], #MainMenu, footer, .no-print, .stButton, .stDownloadButton { display:none!important; }
+        .block-container { max-width:100%!important; padding:0!important; }
+        .stApp { background:white!important; }
+        .content-card, .flat-card, .doc-page { box-shadow:none!important; border:none!important; }
+        .label-grid { grid-template-columns:repeat(2, 1fr); }
     }
     </style>
     """,
@@ -642,580 +498,742 @@ st.markdown(
 
 
 # =========================================================
-# HEADER
+# SIDEBAR
 # =========================================================
-status_text = "Supabase" if storage.mode == "supabase" else "SQLite local démo"
-
-st.markdown(
-    f"""
-    <div class="topbar">
-        <div>
-            <div class="brand-title">🛡️ SteriTrace Cabinet</div>
-            <div class="brand-sub">Traçabilité simplifiée des cycles de stérilisation</div>
+with st.sidebar:
+    st.markdown(
+        f"""
+        <div class="app-logo">
+            <div class="mark">ST</div>
+            <div>
+                <div class="name">{APP_NAME}</div>
+                <div class="sub">cabinet connecté</div>
+            </div>
         </div>
-        <div class="status-pill">● Stockage : {status_text}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    menu = st.radio(
+        "",
+        ["Dashboard", "Étiquettes", "Dossiers stérilisation", "Dossiers traçabilité"],
+        index=["Dashboard", "Étiquettes", "Dossiers stérilisation", "Dossiers traçabilité"].index(st.session_state.menu)
+        if st.session_state.menu in ["Dashboard", "Étiquettes", "Dossiers stérilisation", "Dossiers traçabilité"] else 0,
+        label_visibility="collapsed",
+    )
+    st.session_state.menu = menu
+
+    st.markdown('<div class="sidebar-small-title">Configuration</div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-muted">🌡️ Stérilisateurs <span>🔒</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-muted">👥 Opérateurs <span>🔒</span></div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-muted">📦 Dispositifs <span>🔒</span></div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-small-title">Besoin d’en savoir plus ?</div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-muted">⬇️ Guide de stérilisation</div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-muted">⚖️ Réglementations</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="sidebar-small-title">Une question ?</div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-muted">❔ FAQ</div>', unsafe_allow_html=True)
+    st.markdown('<div class="side-muted">🎧 Contactez le support</div>', unsafe_allow_html=True)
+
+    st.markdown(
+        """
+        <div class="side-disclaimer">
+        🟠 SteriTrace est un outil d’aide à la traçabilité. Il ne remplace pas la procédure qualité du cabinet ni une validation réglementaire.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# =========================================================
+# COMPOSANTS VISUELS
+# =========================================================
+def page_header(icon: str, title: str, subtitle: str) -> None:
+    st.markdown(
+        f"""
+        <div class="hero-title"><h1>{icon} {title}</h1></div>
+        <div class="page-subtitle">{subtitle}</div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def status_tag(text: str, color: str = "blue") -> str:
+    cls = "green" if color == "green" else "gray" if color == "gray" else ""
+    return f'<span class="tag {cls}">{text}</span>'
+
+
+def stepper(current: int) -> None:
+    labels = ["Date & Opérateur", "Stérilisateur & Cycle", "Dispositifs", "Récapitulatif"]
+    html = '<div class="stepper">'
+    for idx, label in enumerate(labels, 1):
+        active = "active" if idx <= current else ""
+        html += f'<div class="step {active}"><span class="num">{"✓" if idx < current else idx}</span>{label}</div>'
+        if idx < len(labels):
+            html += '<div class="step-line"></div>'
+    html += '</div>'
+    st.markdown(html, unsafe_allow_html=True)
+
+
+def cycle_doc_html(event: Dict[str, Any]) -> str:
+    devices = event.get("devices_json", []) or []
+    checks = event.get("checks_json", {}) or {}
+    devices_rows = "".join(
+        f"<tr><td>{d.get('name','')}</td><td>{d.get('category','')}</td><td>{d.get('qty','')}</td></tr>"
+        for d in devices
+    ) or '<tr><td colspan="3">Aucun dispositif renseigné</td></tr>'
+    checks_rows = "".join(
+        f"<tr><td>{label}</td><td>{'Conforme' if bool(value) else 'Non conforme'}</td></tr>"
+        for label, value in checks.items()
+    )
+    return f"""
+    <div class="doc-page">
+        <div class="doc-header">
+            <div>
+                <div style="font-size:18px;font-weight:900;color:#13243a;">{APP_NAME}</div>
+                <div style="font-size:11px;color:#64748b;">Cabinet dentaire · dossier de stérilisation</div>
+            </div>
+            <div style="font-size:11px;color:#64748b;text-align:right;">
+                Édité le {datetime.now().strftime('%d/%m/%Y')}<br>
+                Stockage : {storage.mode}
+            </div>
+        </div>
+        <div class="doc-band">Dossier de stérilisation</div>
+        <div class="doc-body">
+            <div class="three-grid">
+                <div class="flat-card"><div class="small-muted">Lot court</div><h2>{event.get('lot_short','')}</h2></div>
+                <div class="flat-card"><div class="small-muted">Lot complet</div><h2 style="font-size:16px!important;">{event.get('lot_number','')}</h2></div>
+                <div class="flat-card"><div class="small-muted">DLU</div><h2>{fr_date(event.get('dlu_date'))}</h2></div>
+            </div>
+            <table class="doc-table" style="margin-top:14px;">
+                <tr><th>Date</th><td>{fr_date(event.get('event_date'))}</td><th>Opérateur</th><td>{event.get('operator_name','')}</td></tr>
+                <tr><th>Stérilisateur</th><td>{event.get('sterilizer_name','')}</td><th>N° série</th><td>{event.get('sterilizer_serial','')}</td></tr>
+                <tr><th>Cycle</th><td>{event.get('cycle_type','')}</td><th>N° cycle</th><td>{event.get('cycle_number','')}</td></tr>
+                <tr><th>Conditionnement</th><td>{event.get('packaging_type','')}</td><th>Mode</th><td>{event.get('identification_mode','')}</td></tr>
+            </table>
+            <h3 style="margin-top:22px;">Dispositifs</h3>
+            <table class="doc-table"><thead><tr><th>Nom</th><th>Catégorie</th><th>Quantité</th></tr></thead><tbody>{devices_rows}</tbody></table>
+            <h3 style="margin-top:22px;">Contrôles de libération</h3>
+            <table class="doc-table"><thead><tr><th>Contrôle</th><th>Résultat</th></tr></thead><tbody>{checks_rows}</tbody></table>
+            <div style="margin-top:28px;border:1px solid #dfe8f3;border-radius:8px;padding:14px;min-height:80px;">
+                <strong>Signature / visa :</strong>
+            </div>
+        </div>
     </div>
-    """,
-    unsafe_allow_html=True,
-)
+    """
+
+
+def patient_doc_html(patient_ref: str, act_label: str, practitioner: str, lots: List[Dict[str, Any]], notes: str = "") -> str:
+    rows = "".join(
+        f"<tr><td>{lot.get('lot_short','')}</td><td>{lot.get('lot_number','')}</td><td>{lot.get('sterilizer_name','')}</td><td>{lot.get('cycle_type','')}</td><td>{fr_date(lot.get('dlu_date'))}</td></tr>"
+        for lot in lots
+    )
+    return f"""
+    <div class="doc-page">
+        <div class="doc-header">
+            <div>
+                <div style="font-size:18px;font-weight:900;color:#13243a;">{APP_NAME}</div>
+                <div style="font-size:11px;color:#64748b;">Cabinet dentaire · dossier de traçabilité</div>
+            </div>
+            <div style="font-size:11px;color:#64748b;text-align:right;">
+                Édité le {datetime.now().strftime('%d/%m/%Y')}<br>
+                Réf. patient : {patient_ref}
+            </div>
+        </div>
+        <div class="doc-band">Dossier de traçabilité</div>
+        <div class="doc-body">
+            <table class="doc-table">
+                <tr><th>Patient / dossier</th><td>{patient_ref}</td><th>Praticien</th><td>{practitioner}</td></tr>
+                <tr><th>Acte</th><td colspan="3">{act_label}</td></tr>
+            </table>
+            <h3 style="margin-top:22px;">Lots utilisés</h3>
+            <table class="doc-table">
+                <thead><tr><th>Lot court</th><th>Lot complet</th><th>Stérilisateur</th><th>Cycle</th><th>DLU</th></tr></thead>
+                <tbody>{rows}</tbody>
+            </table>
+            <h3 style="margin-top:22px;">Commentaire</h3>
+            <div style="border:1px solid #dfe8f3;border-radius:8px;min-height:90px;padding:12px;color:#334155;">{notes}</div>
+        </div>
+    </div>
+    """
 
 
 # =========================================================
-# NAV
+# PAGE DASHBOARD
 # =========================================================
-nav1, nav2, nav3, nav4 = st.columns(4)
-with nav1:
-    if st.button("📊 Dashboard"):
-        st.session_state.menu = "Dashboard"
-with nav2:
-    if st.button("🧪 Contrôles"):
-        st.session_state.menu = "Controles"
-with nav3:
-    if st.button("➕ Nouveau cycle"):
-        st.session_state.menu = "Cycle"
-with nav4:
-    if st.button("👤 Traçabilité patient"):
-        st.session_state.menu = "Patient"
+def page_dashboard() -> None:
+    page_header("▦", "Dashboard", "Retrouvez vos cycles de stérilisation et les étiquettes associées.")
+    events = storage.list_events(limit=500)
+    month_prefix = datetime.now().strftime("%Y-%m")
+    month_events = [e for e in events if str(e.get("event_date", e.get("created_at", ""))).startswith(month_prefix)]
+    today_events = [e for e in events if str(e.get("event_date", e.get("created_at", ""))).startswith(today_iso())]
 
+    cycles = [e for e in month_events if e.get("event_type") == "sterilization"]
+    tests = [e for e in month_events if e.get("event_type") == "test"]
+    device_count = sum(int(e.get("devices_count") or 0) for e in cycles)
 
-# =========================================================
-# PAGE: DASHBOARD
-# =========================================================
-if st.session_state.menu == "Dashboard":
-    cycles = storage.list_cycles(limit=100)
-    total_cycles = len(cycles)
-    today_cycles = len([c for c in cycles if str(c.get("created_at", "")).startswith(datetime.now().strftime("%Y-%m-%d"))])
+    st.markdown(f'<div class="mini-title">Infos du mois · <span class="small-muted">{current_month_label()}</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="kpi-row">
+            <div class="kpi-pill"><span class="metric-dot">↻</span><strong>{len(month_events)}</strong> Cycles</div>
+            <div class="kpi-pill"><span class="metric-dot">🛡</span><strong>{len(cycles)}</strong> Stérilisations</div>
+            <div class="kpi-pill"><span class="metric-dot green-dot">⊙</span><strong>{len(tests)}</strong> Tests</div>
+            <div class="kpi-pill"><span class="metric-dot">◈</span><strong>{device_count}</strong> Dispositifs stérilisés</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    daily_control = storage.get_daily_control(today_str())
-    weekly_control = storage.get_weekly_control(current_week_key())
+    # Top cards
+    op_counts: Dict[str, int] = {}
+    dev_counts: Dict[str, int] = {}
+    for e in cycles:
+        op = e.get("operator_name") or "—"
+        op_counts[op] = op_counts.get(op, 0) + 1
+        for d in e.get("devices_json", []) or []:
+            name = d.get("name", "—")
+            dev_counts[name] = dev_counts.get(name, 0) + int(d.get("qty", 0))
+    top_op = max(op_counts.items(), key=lambda x: x[1]) if op_counts else ("Aucun", 0)
+    top_devices = sorted(dev_counts.items(), key=lambda x: x[1], reverse=True)[:3]
+    if not top_devices:
+        top_devices = [("Aucun dispositif", 0)]
 
-    c1, c2, c3, c4 = st.columns(4)
-    with c1:
-        st.markdown(
-            f"""
-            <div class="kpi">
-                <div class="kpi-label">Cycles enregistrés</div>
-                <div class="kpi-value">{total_cycles}</div>
+    top_devices_html = "".join(f"<li><strong>{name}</strong> · {qty} étiquettes</li>" for name, qty in top_devices)
+    st.markdown(
+        f"""
+        <div class="two-grid">
+            <div class="flat-card">
+                <div class="small-muted">👤 Opérateur le plus actif</div>
+                <div style="font-weight:900;color:#13243a;margin-top:8px;">{top_op[0]} · {top_op[1]} cycles</div>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c2:
-        st.markdown(
-            f"""
-            <div class="kpi">
-                <div class="kpi-label">Cycles du jour</div>
-                <div class="kpi-value">{today_cycles}</div>
+            <div class="flat-card">
+                <div class="small-muted">☆ Top dispositifs</div>
+                <ol style="margin:8px 0 0 18px;padding:0;color:#13243a;font-size:13px;">{top_devices_html}</ol>
             </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c3:
-        helix_state = "OK" if (daily_control and daily_control.get("helix_ok")) else "À faire"
-        st.markdown(
-            f"""
-            <div class="kpi">
-                <div class="kpi-label">Test Helix du jour</div>
-                <div class="kpi-value" style="font-size:26px;">{helix_state}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-    with c4:
-        vacuum_state = "OK" if (weekly_control and weekly_control.get("vacuum_ok")) else "À faire"
-        st.markdown(
-            f"""
-            <div class="kpi">
-                <div class="kpi-label">Test de vide semaine</div>
-                <div class="kpi-value" style="font-size:26px;">{vacuum_state}</div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Journal des cycles</div>', unsafe_allow_html=True)
-    st.markdown('<div class="section-sub">Historique récent des lots libérés et archivés.</div>', unsafe_allow_html=True)
+    st.markdown("### Cycles du jour")
+    today_cycles = [e for e in today_events if e.get("event_type") == "sterilization"]
+    today_tests = [e for e in today_events if e.get("event_type") == "test"]
+    today_devices = sum(int(e.get("devices_count") or 0) for e in today_cycles)
+    st.markdown(
+        f"""
+        <div class="kpi-row">
+            <div class="kpi-pill"><span class="metric-dot">↻</span><strong>{len(today_events)}</strong> Cycles</div>
+            <div class="kpi-pill"><span class="metric-dot">🛡</span><strong>{len(today_cycles)}</strong> Stérilisations</div>
+            <div class="kpi-pill"><span class="metric-dot green-dot">⊙</span><strong>{len(today_tests)}</strong> Tests</div>
+            <div class="kpi-pill"><span class="metric-dot">◈</span><strong>{today_devices}</strong> Dispositifs stérilisés</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    if cycles:
-        df = pd.DataFrame(cycles)
-        display_cols = [
-            "lot_short",
-            "lot_number",
-            "operator_name",
-            "autoclave_name",
-            "cycle_number",
-            "cycle_type",
-            "dlu_date",
-            "created_at",
-        ]
-        df = df[[c for c in display_cols if c in df.columns]]
-        rename_map = {
-            "lot_short": "Lot court",
-            "lot_number": "Lot complet",
-            "operator_name": "Opérateur",
-            "autoclave_name": "Autoclave",
-            "cycle_number": "N° cycle",
-            "cycle_type": "Programme",
-            "dlu_date": "DLU",
-            "created_at": "Créé le",
-        }
-        df = df.rename(columns=rename_map)
-        st.dataframe(df, use_container_width=True, hide_index=True)
+    if not today_events:
+        st.info("Aucun cycle enregistré aujourd’hui. Créez un test ou une stérilisation depuis Étiquettes.")
     else:
-        st.info("Aucun cycle enregistré pour le moment.")
-    st.markdown("</div>", unsafe_allow_html=True)
+        by_auto: Dict[str, List[Dict[str, Any]]] = {}
+        for e in today_events:
+            by_auto.setdefault(e.get("sterilizer_name", "Autoclave"), []).append(e)
+        for auto, rows in by_auto.items():
+            tests_html = "".join(
+                f'<div style="font-size:12px;margin-top:8px;">{fr_datetime(e.get("created_at"))[-5:]} &nbsp; {status_tag(e.get("cycle_type","Test"), "green")}</div>'
+                for e in rows if e.get("event_type") == "test"
+            )
+            cycles_html = "".join(
+                f'<div style="font-size:12px;margin-top:8px;">{fr_datetime(e.get("created_at"))[-5:]} &nbsp; {status_tag(e.get("cycle_type","Cycle"), "gray")} Lot {e.get("lot_short", "")}</div>'
+                for e in rows if e.get("event_type") == "sterilization"
+            )
+            block_html = f'<div class="blue-card"><strong>♨️ {auto}</strong>'
+            if tests_html:
+                block_html += '<div class="small-muted" style="margin-top:12px;font-weight:800;">CYCLES DE TEST</div>' + tests_html
+            if cycles_html:
+                block_html += '<div class="small-muted" style="margin-top:12px;font-weight:800;">CYCLES DE STÉRILISATION</div>' + cycles_html
+            block_html += '</div><br>'
+            st.markdown(block_html, unsafe_allow_html=True)
+
+    if storage.error:
+        st.warning("Supabase n’est pas encore utilisable avec le nouveau schéma. L’application utilise SQLite local. Lancez le fichier SQL V3 dans Supabase puis redémarrez.")
 
 
 # =========================================================
-# PAGE: CONTROLES
+# PAGE ÉTIQUETTES / CYCLE
 # =========================================================
-elif st.session_state.menu == "Controles":
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Contrôles minimums</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-sub">On enregistre ici le strict minimum pratique : Helix du jour + test de vide hebdomadaire.</div>',
-        unsafe_allow_html=True,
-    )
+def page_labels() -> None:
+    page_header("🏷️", "Étiquettes", "Générez un cycle, son dossier, son QR unique et le marquage sachet simplifié.")
+    stepper(st.session_state.label_step)
 
-    today_control = storage.get_daily_control(today_str())
-    week_control = storage.get_weekly_control(current_week_key())
+    # Navigation buttons for steps are inside each section
+    step = st.session_state.label_step
 
-    col_a, col_b = st.columns(2)
-
-    with col_a:
-        st.markdown('<div class="soft-box">', unsafe_allow_html=True)
-        st.markdown("### 🧪 Test Helix du jour")
-        with st.form("daily_helix_form"):
-            helix_ok = st.checkbox(
-                "Test Helix conforme",
-                value=bool(today_control.get("helix_ok")) if today_control else False,
-            )
-            helix_operator = st.text_input(
-                "Réalisé par",
-                value=today_control.get("operator_name", "") if today_control else "",
-            )
-            helix_notes = st.text_area(
-                "Notes",
-                value=today_control.get("notes", "") if today_control else "",
-                placeholder="Optionnel",
-            )
-            submit_helix = st.form_submit_button("Enregistrer le test Helix")
-            if submit_helix:
-                storage.save_daily_control(today_str(), helix_ok, helix_operator, helix_notes)
-                st.success("Test Helix enregistré.")
-                st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    with col_b:
-        st.markdown('<div class="soft-box">', unsafe_allow_html=True)
-        st.markdown("### 🧪 Test de vide hebdomadaire")
-        with st.form("weekly_vacuum_form"):
-            vacuum_ok = st.checkbox(
-                "Test de vide conforme",
-                value=bool(week_control.get("vacuum_ok")) if week_control else False,
-            )
-            vacuum_operator = st.text_input(
-                "Réalisé par",
-                value=week_control.get("operator_name", "") if week_control else "",
-            )
-            vacuum_notes = st.text_area(
-                "Notes",
-                value=week_control.get("notes", "") if week_control else "",
-                placeholder="Optionnel",
-            )
-            submit_vacuum = st.form_submit_button("Enregistrer le test de vide")
-            if submit_vacuum:
-                storage.save_weekly_control(current_week_key(), vacuum_ok, vacuum_operator, vacuum_notes)
-                st.success("Test de vide enregistré.")
-                st.rerun()
-        st.markdown("</div>", unsafe_allow_html=True)
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-
-# =========================================================
-# PAGE: CYCLE
-# =========================================================
-elif st.session_state.menu == "Cycle":
-    daily_control = storage.get_daily_control(today_str())
-    weekly_control = storage.get_weekly_control(current_week_key())
-
-    step = st.session_state.step
-
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown(f'<div class="section-title">Nouveau cycle — étape {step}/4</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-sub">Workflow simplifié : on coche le minimum utile, puis l’application édite tout automatiquement.</div>',
-        unsafe_allow_html=True,
-    )
-
-    progress_map = {1: 0.25, 2: 0.5, 3: 0.75, 4: 1.0}
-    st.progress(progress_map.get(step, 0.25))
-
-    # Step 1
     if step == 1:
-        st.markdown("### 1. Identification")
-        code = st.text_input("Code opérateur", type="password")
-        if st.button("Authentifier et continuer"):
-            if code in OPERATORS:
-                st.session_state.operator_name = OPERATORS[code]
-                st.session_state.step = 2
-                st.rerun()
-            else:
-                st.error("Code opérateur invalide.")
-
-    # Step 2
-    elif step == 2:
-        st.markdown("### 2. Contrôles préalables + paramètres")
-
+        st.markdown("### Date & Opérateur")
         c1, c2 = st.columns(2)
         with c1:
-            if daily_control and daily_control.get("helix_ok"):
-                st.markdown('<span class="success-chip">Helix du jour enregistré</span>', unsafe_allow_html=True)
-            else:
-                st.markdown('<span class="warn-chip">Helix du jour non enregistré</span>', unsafe_allow_html=True)
-
+            event_date = st.date_input("Date du cycle", value=date.today())
         with c2:
-            if weekly_control and weekly_control.get("vacuum_ok"):
-                st.markdown('<span class="success-chip">Test de vide hebdo enregistré</span>', unsafe_allow_html=True)
+            operator_mode = st.radio("Identification", ["Code opérateur", "Sélection manuelle"], horizontal=True)
+            if operator_mode == "Code opérateur":
+                code = st.text_input("Code opérateur", type="password")
+                operator = OPERATORS.get(code, "")
+                if code and not operator:
+                    st.error("Code inconnu.")
+                if operator:
+                    st.success(f"Opérateur : {operator}")
             else:
-                st.markdown('<span class="warn-chip">Test de vide hebdo non enregistré</span>', unsafe_allow_html=True)
-
-        st.markdown("---")
-        pre_helix = st.checkbox("☑ Je confirme que le test Helix du jour est conforme")
-        pre_vacuum = st.checkbox("☑ Je confirme que le test de vide hebdomadaire est conforme")
-        check_load = st.checkbox("☑ Charge homogène et correctement disposée")
-        check_pack = st.checkbox("☑ Sachets correctement préparés avant cycle")
-
-        col1, col2 = st.columns(2)
-        with col1:
-            selected_machine = st.selectbox("Autoclave", list(AUTOCLAVES.keys()))
-            cycle_number = st.text_input("Numéro de cycle machine", placeholder="Ex : 1452")
-        with col2:
-            cycle_type = st.selectbox(
-                "Programme",
-                [
-                    "Prion 134°C - 18 min",
-                    "Test Helix",
-                    "Test Bowie-Dick",
-                ],
-                index=0,
-            )
-
-        colb1, colb2 = st.columns(2)
-        with colb1:
-            if st.button("Retour"):
-                st.session_state.step = 1
-                st.rerun()
-        with colb2:
-            if st.button("Continuer vers la composition"):
-                if not cycle_number:
-                    st.error("Le numéro de cycle machine est obligatoire.")
-                elif not (pre_helix and pre_vacuum and check_load and check_pack):
-                    st.error("Merci de cocher tous les contrôles minimums avant de continuer.")
+                operator = st.selectbox("Opérateur", list(OPERATORS.values()))
+        b1, b2 = st.columns([1, 1])
+        with b2:
+            if st.button("Suivant ›"):
+                if not operator:
+                    st.error("Choisissez ou authentifiez un opérateur.")
                 else:
-                    st.session_state.cycle_data = {
-                        "autoclave_name": selected_machine,
-                        "serial_number": AUTOCLAVES[selected_machine],
-                        "cycle_number": cycle_number,
-                        "cycle_type": cycle_type,
-                        "precheck_helix_ok": True,
-                        "precheck_vacuum_ok": True,
-                    }
-                    st.session_state.step = 3
+                    st.session_state.draft.update({"event_date": event_date.isoformat(), "operator_name": operator})
+                    st.session_state.label_step = 2
                     st.rerun()
 
-    # Step 3
+    elif step == 2:
+        st.markdown("### Stérilisateur & Cycle")
+        c1, c2 = st.columns(2)
+        with c1:
+            sterilizer = st.selectbox("Stérilisateur", list(STERILIZERS.keys()))
+            cycle_type = st.selectbox("Type de cycle", CYCLE_TYPES)
+            cycle_number = st.text_input("Numéro de cycle machine", placeholder="Ex : 67")
+        with c2:
+            packaging = st.radio("Conditionnement", ["Sachet simple — DLU 3 mois", "Double emballage / cassette — DLU 6 mois"])
+            identification_mode = st.radio(
+                "Mode d’identification",
+                ["Marquage manuel recommandé : LOT court + DLU", "Étiquettes QR individuelles"],
+            )
+
+        is_test = cycle_type in ["Helix", "Vacuum", "Bowie-Dick"]
+        if is_test:
+            st.info("Ce cycle sera enregistré comme test. Il n’y aura pas de DLU ni de dispositifs obligatoires.")
+        else:
+            st.markdown("#### Minimum à cocher avant lancement")
+            ck1 = st.checkbox("Cycle Prion 134°C / 18 min sélectionné")
+            ck2 = st.checkbox("Charge homogène et sachets correctement disposés")
+            ck3 = st.checkbox("Stérilisateur identifié")
+
+        b1, b2 = st.columns([1, 1])
+        with b1:
+            if st.button("‹ Retour"):
+                st.session_state.label_step = 1
+                st.rerun()
+        with b2:
+            if st.button("Suivant ›"):
+                if not cycle_number:
+                    st.error("Le numéro de cycle est obligatoire.")
+                elif not is_test and not all([ck1, ck2, ck3]):
+                    st.error("Cochez le minimum avant de continuer.")
+                else:
+                    st.session_state.draft.update({
+                        "sterilizer_name": sterilizer,
+                        "sterilizer_serial": STERILIZERS[sterilizer],
+                        "cycle_type": cycle_type,
+                        "cycle_number": cycle_number,
+                        "packaging_type": packaging,
+                        "identification_mode": identification_mode,
+                        "event_type": "test" if is_test else "sterilization",
+                    })
+                    if is_test:
+                        st.session_state.label_step = 4
+                    else:
+                        st.session_state.label_step = 3
+                    st.rerun()
+
     elif step == 3:
-        st.markdown("### 3. Composition et conditionnement")
+        left, right = st.columns([2.1, 1])
+        with left:
+            st.markdown("### Dispositifs")
+            st.markdown('<div class="small-muted">Sélectionnez les dispositifs présents dans la charge. Le mode recommandé reste : LOT court + DLU sur sachet.</div>', unsafe_allow_html=True)
 
-        devices = st.multiselect(
-            "Dispositifs stérilisés",
-            MEDICAL_DEVICES,
-            default=st.session_state.selected_devices,
-        )
+            st.markdown("#### ❤️ Favoris")
+            favs = [d for d in DEVICES if d.get("favorite")]
+            fav_cols = st.columns(min(4, len(favs)))
+            for idx, device in enumerate(favs):
+                with fav_cols[idx % len(fav_cols)]:
+                    st.markdown(
+                        f"""
+                        <div class="device-card">
+                            <div class="device-name">{device['name']}</div>
+                            <div class="device-sub">{device['category']} · {device['shelf_days']} jours</div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("+ Ajouter", key=f"fav_{device['name']}"):
+                        add_to_cart(device["name"])
+                        st.rerun()
 
-        packaging_type = st.radio(
-            "Type d’emballage",
-            [
-                "Sachet simple — DLU 3 mois",
-                "Double ensachage / cassette — DLU 6 mois",
-            ],
-            index=0,
-        )
+            st.markdown("#### Catalogue")
+            query = st.text_input("Rechercher", placeholder="Rechercher…")
+            category = st.selectbox("Catégorie", ["Toutes les catégories"] + sorted(set(d["category"] for d in DEVICES)))
+            filtered = DEVICES
+            if query:
+                filtered = [d for d in filtered if query.lower() in d["name"].lower()]
+            if category != "Toutes les catégories":
+                filtered = [d for d in filtered if d["category"] == category]
 
-        days = 90 if "3 mois" in packaging_type else 180
-        dlu_date = datetime.now() + timedelta(days=days)
+            for device in filtered:
+                cols = st.columns([2, 1, 1, 1])
+                with cols[0]:
+                    st.write(f"**{device['name']}**")
+                with cols[1]:
+                    st.caption(device["category"])
+                with cols[2]:
+                    st.caption(f"DLU {device['shelf_days']} j")
+                with cols[3]:
+                    if st.button("+", key=f"add_{device['name']}"):
+                        add_to_cart(device["name"])
+                        st.rerun()
 
-        st.markdown(
-            f"""
-            <div class="soft-box">
-                <div class="mini-title">DLU calculée automatiquement</div>
-                <div>La DLU proposée est : <strong>{dlu_date.strftime("%d/%m/%Y")}</strong></div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        with right:
+            st.markdown("### Sélection")
+            items = cart_items()
+            st.caption(f"{cart_total()} éléments dans la charge")
+            if not items:
+                st.info("Aucun dispositif sélectionné.")
+            else:
+                for item in items:
+                    st.write(f"**{item['name']}**  ")
+                    cminus, cnum, cplus, cdel = st.columns([1, 1.2, 1, 1])
+                    with cminus:
+                        if st.button("−", key=f"minus_{item['name']}"):
+                            st.session_state.cart[item["name"]] = max(0, st.session_state.cart[item["name"]] - 1)
+                            if st.session_state.cart[item["name"]] == 0:
+                                remove_from_cart(item["name"])
+                            st.rerun()
+                    with cnum:
+                        st.write(str(item["qty"]))
+                    with cplus:
+                        if st.button("+", key=f"plus_{item['name']}"):
+                            add_to_cart(item["name"])
+                            st.rerun()
+                    with cdel:
+                        if st.button("🗑", key=f"del_{item['name']}"):
+                            remove_from_cart(item["name"])
+                            st.rerun()
+            st.markdown("<hr>", unsafe_allow_html=True)
+            b1, b2 = st.columns(2)
+            with b1:
+                if st.button("‹ Retour", key="device_back"):
+                    st.session_state.label_step = 2
+                    st.rerun()
+            with b2:
+                if st.button("Suivant ›", key="device_next"):
+                    if cart_total() <= 0:
+                        st.error("Ajoutez au moins un dispositif.")
+                    else:
+                        st.session_state.label_step = 4
+                        st.rerun()
 
-        colb1, colb2 = st.columns(2)
-        with colb1:
-            if st.button("Retour aux paramètres"):
-                st.session_state.step = 2
-                st.rerun()
-        with colb2:
-            if st.button("Continuer vers la validation"):
-                st.session_state.selected_devices = devices if devices else ["Instrumentation générale"]
-                st.session_state.calculated_dlu = dlu_date
-                st.session_state.cycle_data["packaging_type"] = packaging_type
-                st.session_state.step = 4
-                st.rerun()
-
-    # Step 4
     elif step == 4:
-        st.markdown("### 4. Validation post-cycle")
+        draft = st.session_state.draft
+        event_type = draft.get("event_type", "sterilization")
 
-        ticket_ok = st.checkbox("☑ Ticket autoclave conforme")
-        temp_ok = st.checkbox("☑ Température atteinte (134°C min)")
-        duration_ok = st.checkbox("☑ Durée plateau conforme (18 min min)")
-        pressure_ok = st.checkbox("☑ Pression conforme")
-        dry_ok = st.checkbox("☑ Sachets secs")
-        seal_ok = st.checkbox("☑ Soudures intactes")
-        indicator_ok = st.checkbox("☑ Indicateurs de passage virés")
-        prion_ok = st.checkbox("☑ Test prion / classe 6 conforme")
-        released_ok = st.checkbox("☑ Charge libérée")
+        if "lot_number" not in draft:
+            seq = storage.next_sequence()
+            draft["lot_short"] = f"{seq:04d}"
+            draft["lot_number"] = f"STE-{datetime.now().strftime('%y%m%d')}-{seq:04d}"
+            st.session_state.draft = draft
 
-        if not st.session_state.generated_lot_full or not st.session_state.generated_lot_short:
-            seq = storage.next_lot_sequence()
-            st.session_state.generated_lot_full = f"LOT-{datetime.now().strftime('%Y%m%d')}-{seq:04d}"
-            st.session_state.generated_lot_short = f"{seq:04d}"
-
-        lot_full = st.session_state.generated_lot_full
-        lot_short = st.session_state.generated_lot_short
-        dlu_value = st.session_state.calculated_dlu.strftime("%d/%m/%Y")
+        if event_type == "sterilization":
+            days = 180 if "Double" in draft.get("packaging_type", "") else 90
+            dlu = datetime.strptime(draft["event_date"], "%Y-%m-%d") + timedelta(days=days)
+            dlu_iso = dlu.date().isoformat()
+        else:
+            dlu_iso = None
 
         qr_payload = json.dumps(
             {
-                "lot_number": lot_full,
-                "lot_short": lot_short,
-                "dlu_date": st.session_state.calculated_dlu.strftime("%Y-%m-%d"),
-                "cycle_number": st.session_state.cycle_data["cycle_number"],
-                "autoclave_name": st.session_state.cycle_data["autoclave_name"],
+                "app": APP_NAME,
+                "lot": draft.get("lot_number"),
+                "lot_court": draft.get("lot_short"),
+                "cycle": draft.get("cycle_number"),
+                "type": draft.get("cycle_type"),
+                "dlu": dlu_iso,
             },
             ensure_ascii=False,
         )
         qr_base64 = make_qr_base64(qr_payload)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        c_left, c_right = st.columns([1.1, 0.9])
+        st.markdown("### Récapitulatif")
+        left, right = st.columns([1.4, 1])
 
-        with c_left:
-            st.markdown(
-                f"""
-                <div class="mark-box">
-                    <div style="font-size:13px; opacity:0.85;">OPTION 1 — marquage manuel simplifié</div>
-                    <div style="font-size:24px; font-weight:800; margin-top:8px;">À marquer sur chaque sachet</div>
-                    <div style="margin-top:12px; font-size:18px;">
-                        <strong>LOT {lot_short}</strong><br>
-                        <strong>DLU {dlu_value}</strong>
+        with left:
+            if event_type == "sterilization" and "Marquage manuel" in draft.get("identification_mode", ""):
+                st.markdown(
+                    f"""
+                    <div class="manual-mark">
+                        <div style="font-size:12px;color:#dbeafe;font-weight:700;">À MARQUER SUR CHAQUE SACHET</div>
+                        <div class="big">LOT {draft.get('lot_short')}</div>
+                        <div class="big">DLU {fr_date(dlu_iso)}</div>
+                        <div class="subtext">Le QR complet reste archivé sur le dossier du cycle. Pas besoin de coller une étiquette sur chaque sachet.</div>
                     </div>
-                    <div style="margin-top:12px; font-size:13px; opacity:0.9;">
-                        Pas d’étiquette QR sur chaque sachet.<br>
-                        Le QR code complet est conservé sur le dossier du cycle.
-                    </div>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+                    """,
+                    unsafe_allow_html=True,
+                )
 
-        with c_right:
-            st.markdown(
-                f"""
-                <div class="report-box">
-                    <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
-                        <div>
-                            <div style="font-size:20px; font-weight:800; color:#0f172a;">Dossier du cycle</div>
-                            <div style="font-size:13px; color:#64748b;">Traçabilité et archivage</div>
-                            <div style="margin-top:12px; line-height:1.8; font-size:14px; color:#0f172a;">
-                                <strong>Lot complet :</strong> {lot_full}<br>
-                                <strong>Lot court :</strong> {lot_short}<br>
-                                <strong>DLU :</strong> {dlu_value}<br>
-                                <strong>Cycle machine :</strong> {st.session_state.cycle_data["cycle_number"]}<br>
-                                <strong>Autoclave :</strong> {st.session_state.cycle_data["autoclave_name"]}<br>
-                                <strong>Libération :</strong> {st.session_state.operator_name}
+            if event_type == "sterilization" and "Étiquettes QR" in draft.get("identification_mode", ""):
+                st.markdown("#### Aperçu des étiquettes")
+                labels_html = '<div class="label-grid">'
+                for item in cart_items():
+                    for n in range(item["qty"]):
+                        labels_html += f"""
+                        <div class="qr-label">
+                            <div>
+                                <div class="qr-label-title">{item['name']}</div>
+                                <div class="qr-label-text">
+                                    STE : {draft.get('lot_number')}<br>
+                                    DLU : {fr_date(dlu_iso)}<br>
+                                    Autoclave : {draft.get('sterilizer_name')}<br>
+                                    Type : {draft.get('cycle_type')}<br>
+                                    Cycle : {draft.get('cycle_number')}<br>
+                                    Lot : {draft.get('lot_short')}<br>
+                                    Op. : {draft.get('operator_name')}
+                                </div>
+                            </div>
+                            <div style="text-align:right;">
+                                <div class="qr-brand">○ {APP_NAME}</div>
+                                <img src="data:image/png;base64,{qr_base64}" style="width:74px;height:74px;"/>
                             </div>
                         </div>
-                        <div>
-                            <img src="data:image/png;base64,{qr_base64}" style="width:120px; height:120px;" />
-                        </div>
+                        """
+                labels_html += '</div>'
+                st.markdown(labels_html, unsafe_allow_html=True)
+
+            if event_type == "test":
+                st.markdown(
+                    f"""
+                    <div class="manual-mark">
+                        <div style="font-size:12px;color:#dbeafe;font-weight:700;">CYCLE DE TEST</div>
+                        <div class="big">{draft.get('cycle_type')}</div>
+                        <div class="subtext">Cycle test enregistré dans le registre du jour.</div>
                     </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        with right:
+            st.markdown("#### ✓ Récapitulatif")
+            st.markdown(
+                f"""
+                <div class="flat-card">
+                    <div class="small-muted">Date</div>{fr_date(draft.get('event_date'))}<br>
+                    <div class="small-muted">Opérateur</div>{draft.get('operator_name')}<br>
+                    <div class="small-muted">Stérilisateur</div>{draft.get('sterilizer_name')}<br>
+                    <div class="small-muted">Cycle</div>{draft.get('cycle_type')} · n°{draft.get('cycle_number')}<br>
+                    <div class="small-muted">Lot</div>{draft.get('lot_number')} / {draft.get('lot_short')}
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
+            if event_type == "sterilization":
+                st.write("**Dispositifs**")
+                for item in cart_items():
+                    st.write(f"{item['name']} × {item['qty']}")
+            st.image(f"data:image/png;base64,{qr_base64}", width=140)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        render_print_button("Imprimer le dossier du cycle")
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        c1, c2, c3 = st.columns(3)
+        st.markdown("#### Contrôles minimums")
+        c1, c2 = st.columns(2)
         with c1:
-            if st.button("Retour à la composition"):
-                st.session_state.step = 3
-                st.rerun()
+            ticket_ok = st.checkbox("Ticket / rapport cycle conforme")
+            temp_ok = st.checkbox("Température et durée conformes")
+            dry_ok = st.checkbox("Sachets secs") if event_type == "sterilization" else True
         with c2:
-            ready = all([ticket_ok, temp_ok, duration_ok, pressure_ok, dry_ok, seal_ok, indicator_ok, prion_ok, released_ok])
-            if st.button("Enregistrer le lot"):
-                if not ready:
-                    st.error("Toutes les cases de validation doivent être cochées pour enregistrer le lot.")
+            seal_ok = st.checkbox("Soudures intactes") if event_type == "sterilization" else True
+            indicator_ok = st.checkbox("Indicateurs / test virés")
+            released_ok = st.checkbox("Charge libérée / test validé")
+
+        b1, b2, b3 = st.columns([1, 1, 1])
+        with b1:
+            if st.button("‹ Retour"):
+                st.session_state.label_step = 3 if event_type == "sterilization" else 2
+                st.rerun()
+        with b2:
+            render_print_button("Imprimer")
+        with b3:
+            if st.button("Enregistrer"):
+                checks = {
+                    "Ticket / rapport cycle conforme": bool(ticket_ok),
+                    "Température et durée conformes": bool(temp_ok),
+                    "Sachets secs": bool(dry_ok),
+                    "Soudures intactes": bool(seal_ok),
+                    "Indicateurs / test virés": bool(indicator_ok),
+                    "Charge libérée / test validé": bool(released_ok),
+                }
+                if not all(checks.values()):
+                    st.error("Toutes les cases de validation doivent être cochées.")
                 else:
+                    items = cart_items() if event_type == "sterilization" else []
                     payload = {
-                        "lot_number": lot_full,
-                        "lot_short": lot_short,
-                        "operator_name": st.session_state.operator_name,
-                        "autoclave_name": st.session_state.cycle_data["autoclave_name"],
-                        "serial_number": st.session_state.cycle_data["serial_number"],
-                        "cycle_number": st.session_state.cycle_data["cycle_number"],
-                        "cycle_type": st.session_state.cycle_data["cycle_type"],
-                        "devices": ", ".join(st.session_state.selected_devices),
-                        "packaging_type": st.session_state.cycle_data["packaging_type"],
-                        "dlu_date": st.session_state.calculated_dlu.strftime("%Y-%m-%d"),
-                        "precheck_helix_ok": True,
-                        "precheck_vacuum_ok": True,
-                        "ticket_ok": ticket_ok,
-                        "temp_ok": temp_ok,
-                        "duration_ok": duration_ok,
-                        "pressure_ok": pressure_ok,
-                        "dry_ok": dry_ok,
-                        "seal_ok": seal_ok,
-                        "indicator_ok": indicator_ok,
-                        "prion_ok": prion_ok,
-                        "released_ok": released_ok,
+                        "event_type": event_type,
+                        "event_label": draft.get("cycle_type"),
+                        "event_date": draft.get("event_date"),
+                        "operator_name": draft.get("operator_name"),
+                        "sterilizer_name": draft.get("sterilizer_name"),
+                        "sterilizer_serial": draft.get("sterilizer_serial"),
+                        "cycle_number": draft.get("cycle_number"),
+                        "cycle_type": draft.get("cycle_type"),
+                        "lot_number": draft.get("lot_number"),
+                        "lot_short": draft.get("lot_short"),
+                        "dlu_date": dlu_iso,
+                        "packaging_type": draft.get("packaging_type"),
+                        "identification_mode": draft.get("identification_mode"),
+                        "devices_json": items,
+                        "devices_count": sum(i["qty"] for i in items),
+                        "checks_json": checks,
+                        "status": "conforme",
                         "created_at": now_iso(),
                     }
-                    storage.insert_cycle(payload)
-                    st.success(f"Lot enregistré : {lot_full} (marquage sachet : LOT {lot_short})")
-                    reset_cycle_state()
+                    storage.insert_event(payload)
+                    st.success("Enregistré avec succès.")
+                    reset_label_workflow()
                     st.rerun()
-        with c3:
-            if st.button("Annuler le cycle"):
-                reset_cycle_state()
+
+
+# =========================================================
+# PAGE DOSSIERS STÉRILISATION
+# =========================================================
+def page_sterilization_files() -> None:
+    page_header("📄", "Dossiers stérilisation", "Consultez, imprimez et archivez vos dossiers de cycles.")
+    events = storage.list_events(limit=500)
+    if not events:
+        st.info("Aucun dossier pour le moment.")
+        return
+
+    col1, col2 = st.columns([1.2, 2])
+    with col1:
+        st.markdown("### Recherche")
+        search = st.text_input("Lot court ou complet", placeholder="Ex : 0001 ou STE-...")
+        selected = None
+        if search:
+            selected = storage.find_event_by_lot(search)
+            if not selected:
+                st.error("Lot introuvable.")
+        options = [f"{e.get('lot_short','')} · {e.get('cycle_type','')} · {fr_date(e.get('event_date'))}" for e in events]
+        if not selected:
+            idx = st.selectbox("Ou choisir un dossier", range(len(events)), format_func=lambda i: options[i])
+            selected = events[idx]
+
+        df = pd.DataFrame([
+            {
+                "Date": fr_date(e.get("event_date")),
+                "Lot": e.get("lot_short"),
+                "Type": e.get("cycle_type"),
+                "Autoclave": e.get("sterilizer_name"),
+                "Statut": e.get("status"),
+            }
+            for e in events
+        ])
+        st.download_button("⬇️ Export CSV", data=df.to_csv(index=False).encode("utf-8"), file_name="registre_sterilisation.csv", mime="text/csv")
+
+    with col2:
+        if selected:
+            html = cycle_doc_html(selected)
+            st.markdown(html, unsafe_allow_html=True)
+            b1, b2 = st.columns(2)
+            with b1:
+                render_print_button("Imprimer le dossier")
+            with b2:
+                render_download_html(f"dossier_{selected.get('lot_short','lot')}.html", html, "Télécharger HTML")
+
+
+# =========================================================
+# PAGE DOSSIERS TRAÇABILITÉ PATIENT
+# =========================================================
+def page_patient_files() -> None:
+    page_header("📋", "Dossiers traçabilité", "Reliez les lots ouverts à un dossier patient ou un identifiant interne.")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        patient_ref = st.text_input("Référence patient / dossier", value="PAT-2026-001")
+    with c2:
+        act_label = st.text_input("Acte", value="Soin / chirurgie")
+    with c3:
+        practitioner = st.text_input("Praticien", value="Dr Sébastien")
+
+    c4, c5 = st.columns([2, 1])
+    with c4:
+        lot_value = st.text_input("Scanner ou saisir le lot", placeholder="0001 ou STE-...")
+    with c5:
+        st.write("")
+        if st.button("Ajouter le lot"):
+            event = storage.find_event_by_lot(lot_value)
+            if not event:
+                st.error("Lot introuvable.")
+            else:
+                if not any(e.get("lot_number") == event.get("lot_number") for e in st.session_state.patient_cart):
+                    st.session_state.patient_cart.append(event)
                 st.rerun()
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    notes = st.text_area("Commentaire", placeholder="Optionnel")
 
+    if st.session_state.patient_cart:
+        st.markdown("### Lots ajoutés")
+        df = pd.DataFrame([
+            {
+                "Lot court": e.get("lot_short"),
+                "Lot complet": e.get("lot_number"),
+                "Cycle": e.get("cycle_type"),
+                "Autoclave": e.get("sterilizer_name"),
+                "DLU": fr_date(e.get("dlu_date")),
+            }
+            for e in st.session_state.patient_cart
+        ])
+        st.dataframe(df, use_container_width=True, hide_index=True)
 
-# =========================================================
-# PAGE: PATIENT
-# =========================================================
-elif st.session_state.menu == "Patient":
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="section-title">Traçabilité patient</div>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="section-sub">On peut saisir ou scanner un lot. Le scan n’est pas obligatoire : la saisie du lot court suffit.</div>',
-        unsafe_allow_html=True,
-    )
-
-    col1, col2 = st.columns(2)
-    with col1:
-        patient_ref = st.text_input("Référence patient / dossier", value="PAT-2026-001")
-    with col2:
-        patient_act = st.text_input("Acte", value="Soin / chirurgie / endodontie")
-
-    st.markdown("---")
-    entry1, entry2 = st.columns([2, 1])
-    with entry1:
-        lot_input = st.text_input("Saisir ou scanner le lot", placeholder="Ex : 0001 ou LOT-20260625-0001")
-    with entry2:
-        if st.button("Ajouter au dossier"):
-            if lot_input:
-                cycle = storage.find_cycle(lot_input)
-                if cycle:
-                    # éviter doublons
-                    exists = any(item["lot_number"] == cycle["lot_number"] for item in st.session_state.patient_basket)
-                    if not exists:
-                        st.session_state.patient_basket.append(cycle)
-                    st.rerun()
-                else:
-                    st.error("Lot introuvable.")
-
-    if st.session_state.patient_basket:
-        st.markdown("### Lots liés au dossier")
-        rows = []
-        for item in st.session_state.patient_basket:
-            rows.append(
-                {
-                    "Lot court": item.get("lot_short"),
-                    "Lot complet": item.get("lot_number"),
-                    "Autoclave": item.get("autoclave_name"),
-                    "N° cycle": item.get("cycle_number"),
-                    "DLU": item.get("dlu_date"),
-                    "Libéré par": item.get("operator_name"),
-                }
-            )
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        if st.button("Vider la sélection"):
-            st.session_state.patient_basket = []
-            st.rerun()
-
-        rows_html = ""
-        for item in st.session_state.patient_basket:
-            rows_html += f"""
-            <tr>
-                <td>{item.get('lot_short', '')}</td>
-                <td>{item.get('lot_number', '')}</td>
-                <td>{item.get('autoclave_name', '')}</td>
-                <td>{item.get('cycle_number', '')}</td>
-                <td>{item.get('operator_name', '')}</td>
-                <td>{item.get('dlu_date', '')}</td>
-            </tr>
-            """
-
-        report_html = f"""
-        <div class="report-box">
-            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:20px;">
-                <div>
-                    <div style="font-size:20px;font-weight:800;color:#0f172a;">Fiche de traçabilité patient</div>
-                    <div style="font-size:13px;color:#64748b;">Document d’archivage clinique</div>
-                </div>
-                <div style="font-size:12px;color:#475569;text-align:right;">
-                    Date : {datetime.now().strftime("%d/%m/%Y")}<br>
-                    Réf. patient : {patient_ref}
-                </div>
-            </div>
-
-            <div style="margin-top:18px;padding:14px 16px;border-radius:14px;background:#f8fbff;border:1px solid #e6eef8;">
-                <strong>Référence patient :</strong> {patient_ref}<br>
-                <strong>Acte :</strong> {patient_act}
-            </div>
-
-            <table style="width:100%;border-collapse:collapse;margin-top:18px;font-size:13px;">
-                <thead>
-                    <tr>
-                        <th style="text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;">Lot court</th>
-                        <th style="text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;">Lot complet</th>
-                        <th style="text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;">Autoclave</th>
-                        <th style="text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;">Cycle</th>
-                        <th style="text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;">Libération</th>
-                        <th style="text-align:left;padding:10px;border-bottom:1px solid #e2e8f0;">DLU</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {rows_html}
-                </tbody>
-            </table>
-
-            <div style="margin-top:28px;font-size:12px;color:#64748b;">
-                Document édité automatiquement à partir des lots enregistrés dans SteriTrace Cabinet.
-            </div>
-        </div>
-        """
-
-        st.markdown(report_html, unsafe_allow_html=True)
-        st.markdown("<br>", unsafe_allow_html=True)
-        render_print_button("Imprimer la fiche patient")
+        csave, cclear = st.columns(2)
+        with csave:
+            if st.button("Enregistrer la fiche"):
+                for event in st.session_state.patient_cart:
+                    storage.insert_patient_link({
+                        "patient_ref": patient_ref,
+                        "act_label": act_label,
+                        "practitioner_name": practitioner,
+                        "lot_number": event.get("lot_number"),
+                        "lot_short": event.get("lot_short"),
+                        "used_at": now_iso(),
+                        "notes": notes,
+                        "created_at": now_iso(),
+                    })
+                st.success("Fiche patient enregistrée.")
+        with cclear:
+            if st.button("Vider la sélection"):
+                st.session_state.patient_cart = []
+                st.rerun()
     else:
-        st.info("Aucun lot ajouté pour ce dossier patient.")
+        st.info("Aucun lot ajouté.")
 
-    st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.session_state.patient_cart:
+        html = patient_doc_html(patient_ref, act_label, practitioner, st.session_state.patient_cart, notes)
+        st.markdown(html, unsafe_allow_html=True)
+        b1, b2 = st.columns(2)
+        with b1:
+            render_print_button("Imprimer la fiche")
+        with b2:
+            render_download_html(f"tracabilite_{patient_ref}.html", html, "Télécharger HTML")
+
+    links = storage.list_patient_links(limit=50)
+    if links:
+        st.markdown("### Dernières fiches enregistrées")
+        st.dataframe(pd.DataFrame(links), use_container_width=True, hide_index=True)
+
+
+# =========================================================
+# ROUTER
+# =========================================================
+if st.session_state.menu == "Dashboard":
+    page_dashboard()
+elif st.session_state.menu == "Étiquettes":
+    page_labels()
+elif st.session_state.menu == "Dossiers stérilisation":
+    page_sterilization_files()
+elif st.session_state.menu == "Dossiers traçabilité":
+    page_patient_files()
